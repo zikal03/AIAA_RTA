@@ -18,8 +18,11 @@ Fault confirmed  →  VTOL transition to MC (ailerons not needed in MC mode)
 CUSUM building   →  Warn + increase log verbosity (no mode change yet)
 """
 
+import csv
 import math
+import os
 import time
+import queue
 import numpy as np
 import threading
 import rclpy
@@ -44,6 +47,57 @@ BASELINE             = True
 SET_CASE = 3  # 1=no failure no RTA, 2=failure no RTA, 3=failure+RTA
 SIMULATE_FAILURE = SET_CASE in (2, 3)
 RTA_ON           = SET_CASE == 3
+
+LOG_NAME = "roll_rta_log"  # change before each run
+
+# =============================================================================
+# CSV LOGGER
+# =============================================================================
+
+class Logger:
+    """
+    Writes one row per RTA loop tick to a timestamped CSV file.
+    All angles in degrees.
+    """
+    FIELDS = [
+        "timestamp_s",
+        "actual_roll_deg",
+        "desired_roll_deg",
+        "roll_error_deg",
+        "actual_pitch_deg",
+        "desired_pitch_deg",
+        "pitch_error_deg",
+        "llr_val",
+        "cond_a",
+        "cond_b",
+        "rta_fault_confirmed",
+        "servo_failed",
+    ]
+
+    def __init__(self, log_dir: str = None):
+        if log_dir is None:
+            # Default: workspace root (3 levels up from scripts/)
+            log_dir = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+            )
+        ts   = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(log_dir, f"{LOG_NAME}_{ts}.csv")
+        self._f    = open(path, "w", newline="")
+        self._w    = csv.DictWriter(self._f, fieldnames=self.FIELDS)
+        self._w.writeheader()
+        self._path = path
+        print(f"[Logger] Logging to {path}")
+
+    def write(self, row: dict):
+        """Write one row; missing keys default to empty string."""
+        self._w.writerow({f: row.get(f, "") for f in self.FIELDS})
+
+    def flush(self):
+        self._f.flush()
+
+    def close(self):
+        self._f.close()
+        print(f"[Logger] Closed {self._path}")
 
 # =============================================================================
 # ROLL MONITOR PARAMETERS
@@ -163,6 +217,14 @@ class RollRTA(PX4Vehicle):
         self._fault_logged = False
         self.time_started  = time.time()
 
+        # ── CSV logger ────────────────────────────────────────────────────────
+        self._csv_logger = Logger()
+
+        # ── CSV log writer thread ──────────────────────────────────────────────
+        self._log_queue  = queue.Queue()
+        self._log_thread = threading.Thread(target=self._log_writer, daemon=True)
+        self._log_thread.start()
+
         # ── Timers ─────────────────────────────────────────────────────────────
         self.create_timer(0.1, self._tick)        # 10 Hz flight state machine
         if RTA_ON:
@@ -175,7 +237,7 @@ class RollRTA(PX4Vehicle):
             self.get_logger().info("RTA logic disabled — running open-loop")
 
     # =========================================================================
-    # Flight state machine (unchanged)
+    #  state machine 
     # =========================================================================
 
     def _tick(self):
@@ -357,6 +419,9 @@ class RollRTA(PX4Vehicle):
         # ── 6. Corrective action ───────────────────────────────────────────────
         self._corrective_action(d)
 
+        # ── 7. Log ────────────────────────────────────────────────────────────
+        self._write_log()
+
     # =========================================================================
     # Corrective actions
     # =========================================================================
@@ -491,41 +556,37 @@ class RollRTA(PX4Vehicle):
             )
             self._is_fault = True
             #self._action_fault_confirmed()
-        
 
-    def _write_log(self, roll_err, roll_elapsed, roll_llr_v):
-        pitch_ela = (time.monotonic() - self._pitch_gate_start_t
-                     if self._pitch_gate_start_t else float("nan"))
-        dp = self._desired_pitch
-        ap = self._actual_pitch
-        self._csv_logger.write({
+        self._write_log()
+
+    def _log_writer(self):
+        """Background thread: drains the queue and writes rows to CSV."""
+        while True:
+            row = self._log_queue.get()  # blocks here, never in the RTA loop
+            if row is None:              # None is the shutdown sentinel
+                break
+            self._csv_logger.write(row)
+
+    def _write_log(self):
+        """Non-blocking: enqueues a row for the background writer thread."""
+        self._log_queue.put_nowait({
             "timestamp_s":             time.time(),
-            "actual_roll_deg":         math.degrees(self._actual_roll),
+            "actual_roll_deg":         math.degrees(self.current_roll) ,
             "desired_roll_deg":        math.degrees(self._desired_roll),
-            "raw_roll_error_deg":      math.degrees(roll_err),
-            "smoothed_roll_error_deg": math.degrees(self._roll_smoothed_err),
-            "roll_gate_open":          int(self._roll_gate_open),
-            "roll_gate_elapsed_s":     roll_elapsed,
-            "roll_llr":                roll_llr_v if roll_llr_v is not None
-                                       else float("nan"),
-            "roll_cond_a":             int(self._roll_cond_a),
-            "roll_cond_b":             int(self._roll_cond_b),
-            "roll_is_fault":           int(self._roll_is_fault),
-            "actual_pitch_deg":        math.degrees(ap) if ap is not None else float("nan"),
-            "desired_pitch_deg":       math.degrees(dp) if dp is not None else float("nan"),
-            "raw_pitch_error_deg":     math.degrees(dp-ap) if dp is not None
-                                       and ap is not None else float("nan"),
-            "smoothed_pitch_error_deg": math.degrees(self._pitch_smoothed_err),
-            "pitch_gate_open":         int(self._pitch_gate_open),
-            "pitch_gate_elapsed_s":    pitch_ela,
-            "pitch_llr":               math.degrees(self._pitch_llr_val) if self._pitch_llr_val is not None
-                                       else float("nan"),
-            "pitch_cond_a":            int(self._pitch_cond_a),
-            "pitch_cond_b":            int(self._pitch_cond_b),
-            "pitch_is_fault":          int(self._pitch_is_fault),
-            "fault_injected":          int(self._sw_fault_active),
-            "physical_fault_active":   int(self._physical_fault),
-            "nav_state":               self._nav_state,
+            "roll_error_deg":      math.degrees(self._desired_roll - self.current_roll) if self._desired_roll is not None
+                                       and self.current_roll is not None else float("nan"),
+            "actual_pitch_deg":        math.degrees(self.current_pitch) ,
+            "desired_pitch_deg":       math.degrees(self._desired_pitch),
+            "pitch_error_deg":     math.degrees(self._desired_pitch - self.current_pitch) if self._desired_pitch is not None
+                                       and self.current_pitch is not None else float("nan"),
+            "llr_val":                self._llr_val if self._llr_val is not None else float("nan"),
+            "cond_a":                self._cond_a,
+            "cond_b":                self._cond_b,
+
+            "rta_fault_confirmed":       self._is_fault,
+            "servo_failed":          int(self.locked_servo),
+
+
         })
 # =============================================================================
 # MAIN
@@ -539,6 +600,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        node._log_queue.put(None)  # signal writer thread to stop
+        node._log_thread.join()    # wait for any queued rows to flush
+        node._csv_logger.close()
         node.destroy_node()
         rclpy.shutdown()
 
