@@ -40,8 +40,9 @@ WAYPOINTS = [
 
 TAKEOFF_ALT          = 45.0
 SERVO_TO_LOCK        = 0
-ANGLE_TO_LOCK_DEG    = 35.0
-FAILURE_START_SECS   = 150.0
+ANGLE_TO_LOCK_DEG    = 15
+FAILURE_START_SECS   = 500
+FLIGHT_END           = 1000
 BASELINE             = True
 
 SET_CASE = 3  # 1=no failure no RTA, 2=failure no RTA, 3=failure+RTA
@@ -72,6 +73,7 @@ class Logger:
         "cond_b",
         "rta_fault_confirmed",
         "servo_failed",
+        "angle_locked"
     ]
 
     def __init__(self, log_dir: str = None):
@@ -278,7 +280,7 @@ class RollRTA(PX4Vehicle):
         elif self.state == "FLYING_NORMAL":
             wp = WAYPOINTS[self.current_wp_index]
             self._fly_to_waypoint(wp)
-            if time.time() >= self.time_started + 300.0:
+            if time.time() >= self.time_started + FLIGHT_END:
                 self.state = "VTOL_TRANSITION_MC"
                 self._vtol_transition_to_mc()
 
@@ -585,10 +587,10 @@ class RollRTA(PX4Vehicle):
 
             "rta_fault_confirmed":       self._is_fault,
             "servo_failed":          int(self.locked_servo),
+            "angle_locked": ANGLE_TO_LOCK_DEG
 
 
         })
-# =============================================================================
 # MAIN
 # =============================================================================
 
