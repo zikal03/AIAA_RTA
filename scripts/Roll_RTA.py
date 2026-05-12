@@ -16,6 +16,19 @@ Corrective actions
 ------------------
 Fault confirmed  →  VTOL transition to MC (ailerons not needed in MC mode)
 CUSUM building   →  Warn + increase log verbosity (no mode change yet)
+
+Fixes applied
+-------------
+1. Gate close trigger moved into the gate-open branch so it can actually
+   close the gate while it is open (both loops).
+2. _is_fault, _cond_a, _cond_b all reset when gate closes (both loops).
+3. _rta_loop used ROLL_GATE_Z_THRESHOLD for pitch — changed to PITCH_GATE_Z_THRESHOLD.
+4. _rta_loop gate-close path now sets _gate_open=False and resets all conditions.
+5. Settled check re-enabled in _rta_loop_baseline and both loops now behave
+   identically: gate closes via gate_close_trigger OR settled, whichever
+   comes first.
+6. "Gate closed" log message in baseline only fires when gate was actually open.
+7. VTOL_TRANSITION_MC now waits for transition to complete before landing.
 """
 
 import csv
@@ -41,15 +54,16 @@ WAYPOINTS = [
 TAKEOFF_ALT          = 45.0
 SERVO_TO_LOCK        = 0
 ANGLE_TO_LOCK_DEG    = 15
-FAILURE_START_SECS   = 500
-FLIGHT_END           = 1000
+FAILURE_START_SECS   = 150
+FLIGHT_END           = 300
+VTOL_TRANSITION_WAIT = 10.0   # seconds to wait for MC transition before landing
 BASELINE             = True
 
 SET_CASE = 3  # 1=no failure no RTA, 2=failure no RTA, 3=failure+RTA
 SIMULATE_FAILURE = SET_CASE in (2, 3)
 RTA_ON           = SET_CASE == 3
 
-LOG_NAME = "roll_rta_log"  # change before each run
+LOG_NAME = "Test_1"  # change before each run
 
 # =============================================================================
 # CSV LOGGER
@@ -105,26 +119,26 @@ class Logger:
 # =============================================================================
 ROLL_GATE_Z_THRESHOLD       = 5.0
 ROLL_GATE_CLOSE_Z_THRESHOLD = 1.5
-ROLL_SETTLING_TIME_S        = 1.1
-ROLL_SETTLED_THRESHOLD_DEG  = 2.0
+ROLL_SETTLING_TIME_S        = 1.3
 ROLL_MIN_GATE_DURATION      = 1.0
 ROLL_NOMINAL_MEAN_DEG       = -0.2382
 ROLL_NOMINAL_STD_DEG        =  1.4445
 ROLL_FAULTY_MEAN_DEG        =  5.2679
 ROLL_FAULTY_STD_DEG         =  3.1269
+ROLL_SETTLED_THRESHOLD_DEG  = ROLL_NOMINAL_MEAN_DEG + ROLL_NOMINAL_STD_DEG
 
 # =============================================================================
 # PITCH MONITOR PARAMETERS
 # =============================================================================
-PITCH_GATE_Z_THRESHOLD       = 5.0
+PITCH_GATE_Z_THRESHOLD       = 5.0   # FIX 3: was accidentally using ROLL threshold in _rta_loop
 PITCH_GATE_CLOSE_Z_THRESHOLD = 1.5
 PITCH_SETTLING_TIME_S        = 1.3
-PITCH_SETTLED_THRESHOLD_DEG  = 2.0
 PITCH_MIN_GATE_DURATION      = 1.0
-PITCH_NOMINAL_MEAN_DEG       = 0.3037
-PITCH_NOMINAL_STD_DEG        = 1.1359
-PITCH_FAULTY_MEAN_DEG        = 0.1874
-PITCH_FAULTY_STD_DEG         = 0.8273
+PITCH_NOMINAL_MEAN_DEG       =  0.3037
+PITCH_NOMINAL_STD_DEG        =  1.1359
+PITCH_FAULTY_MEAN_DEG        =  0.1874
+PITCH_FAULTY_STD_DEG         =  0.8273
+PITCH_SETTLED_THRESHOLD_DEG  = PITCH_NOMINAL_MEAN_DEG + PITCH_NOMINAL_STD_DEG
 
 WINDOW_SIZE = 5
 
@@ -154,6 +168,18 @@ def _axis_llr(x, mu_nom, sig_nom, mu_flt, sig_flt) -> float:
     )
 
 
+def _reset_gate(node):
+    """
+    Helper: clear all gate + LLR state.
+    Called whenever the gate closes, regardless of reason.
+    """
+    node._gate_open = False
+    node._llr_val   = None
+    node._cond_a    = False   # FIX 2: reset conditions on gate close
+    node._cond_b    = False   # FIX 2
+    node._is_fault  = False   # FIX 2
+
+
 # =============================================================================
 # RollRTA node
 # =============================================================================
@@ -164,7 +190,8 @@ class RollRTA(PX4Vehicle):
         super().__init__()
         self.get_logger().info("Roll RTA node initialized")
 
-        self.locked_servo = False # This is true failure
+        self.locked_servo = False  # True = real servo failure active
+
         self._error_window = deque(maxlen=WINDOW_SIZE)
 
         # ── Layer 1: Gate + LLR state ─────────────────────────────────────────
@@ -172,7 +199,7 @@ class RollRTA(PX4Vehicle):
         self._gate_start_t = 0.0
         self._cond_a       = False
         self._cond_b       = False
-        self._is_fault     = False # Output from RTA indicating a fault
+        self._is_fault     = False  # RTA output: fault confirmed
         self._llr_val      = None
 
         # ── Layer 2: CUSUM state ───────────────────────────────────────────────
@@ -194,8 +221,9 @@ class RollRTA(PX4Vehicle):
         self._P_sigma     = P_sigma
         self._P_sigma_inv = np.linalg.inv(P_sigma)
 
-        self._fault_logged = False
-        self.time_started  = time.time()
+        self._fault_logged       = False
+        self._transition_mc_t    = None   # FIX 7: timestamp when MC transition started
+        self.time_started        = time.time()
 
         # ── CSV logger ────────────────────────────────────────────────────────
         self._csv_logger = Logger()
@@ -259,12 +287,17 @@ class RollRTA(PX4Vehicle):
             wp = WAYPOINTS[self.current_wp_index]
             self._fly_to_waypoint(wp)
             if time.time() >= self.time_started + FLIGHT_END:
-                self.state = "VTOL_TRANSITION_MC"
                 self._vtol_transition_to_mc()
+                self._transition_mc_t = time.time()   # FIX 7: record when transition started
+                self.state = "VTOL_TRANSITION_MC"
 
         elif self.state == "VTOL_TRANSITION_MC":
-            self._vtol_mc_land()
-            self.state = "LANDING"
+            # FIX 7: wait for the transition to complete before commanding land
+            if self._transition_mc_t is not None and \
+                    time.time() - self._transition_mc_t >= VTOL_TRANSITION_WAIT:
+                self.get_logger().info("MC transition complete — commanding land")
+                self._vtol_mc_land()
+                self.state = "LANDING"
 
     # =========================================================================
     # Layer 1 + Layer 2 RTA loop
@@ -280,7 +313,7 @@ class RollRTA(PX4Vehicle):
         err_roll_deg  = math.degrees(err_roll_rad)
         err_pitch_deg = math.degrees(err_pitch_rad)
 
-        # EMA smoothing
+        # EMA smoothing (CUSUM input)
         if self._ema_roll_err is None:
             self._ema_roll_err  = err_roll_deg
             self._ema_pitch_err = err_pitch_deg
@@ -288,18 +321,16 @@ class RollRTA(PX4Vehicle):
             self._ema_roll_err  = CUSUM_ALPHA * err_roll_deg  + (1 - CUSUM_ALPHA) * self._ema_roll_err
             self._ema_pitch_err = CUSUM_ALPHA * err_pitch_deg + (1 - CUSUM_ALPHA) * self._ema_pitch_err
 
-        # Sliding window
+        # Sliding window (Layer 1 input)
         self._error_window.append([err_roll_rad, err_pitch_rad])
         if len(self._error_window) < WINDOW_SIZE:
-            return  # not enough samples — nothing meaningful to log yet
+            return
 
-        n          = len(self._error_window)
-        mean_roll  = sum(s[0] for s in self._error_window) / n
-        mean_pitch = sum(s[1] for s in self._error_window) / n
-        mean_roll_deg  = math.degrees(mean_roll)
-        mean_pitch_deg = math.degrees(mean_pitch)
+        n = len(self._error_window)
+        mean_roll_deg  = math.degrees(sum(s[0] for s in self._error_window) / n)
+        mean_pitch_deg = math.degrees(sum(s[1] for s in self._error_window) / n)
 
-        # Layer 2: CUSUM
+        # ── Layer 2: CUSUM ────────────────────────────────────────────────────
         ema_vec = np.array([self._ema_roll_err, self._ema_pitch_err])
         d       = _mahalanobis(ema_vec, self._P_mu, self._P_sigma_inv)
 
@@ -318,14 +349,14 @@ class RollRTA(PX4Vehicle):
                     f"ema_pitch={self._ema_pitch_err:.2f}°"
                 )
 
-        # Layer 1: Gate + LLR
+        # ── Layer 1: Gate + LLR ───────────────────────────────────────────────
         z_roll  = abs(mean_roll_deg  - ROLL_NOMINAL_MEAN_DEG)  / ROLL_NOMINAL_STD_DEG
         z_pitch = abs(mean_pitch_deg - PITCH_NOMINAL_MEAN_DEG) / PITCH_NOMINAL_STD_DEG
 
-        gate_open_trigger  = (z_roll  > ROLL_GATE_Z_THRESHOLD) or  \
-                             (z_pitch > ROLL_GATE_Z_THRESHOLD)
+        gate_open_trigger  = (z_roll  > ROLL_GATE_Z_THRESHOLD) or \
+                             (z_pitch > PITCH_GATE_Z_THRESHOLD)   # FIX 3: correct variable
         gate_close_trigger = (z_roll  <= ROLL_GATE_CLOSE_Z_THRESHOLD) and \
-                             (z_pitch <= ROLL_GATE_CLOSE_Z_THRESHOLD)
+                             (z_pitch <= PITCH_GATE_CLOSE_Z_THRESHOLD)
 
         if not self._gate_open:
             if gate_open_trigger:
@@ -337,11 +368,21 @@ class RollRTA(PX4Vehicle):
                     f"z_roll={z_roll:.2f}  z_pitch={z_pitch:.2f}  "
                     f"roll={mean_roll_deg:.2f}°  pitch={mean_pitch_deg:.2f}°"
                 )
-            elif gate_close_trigger:
-                self._llr_val  = None
-                self._is_fault = False
         else:
+            # ── Gate is open ──────────────────────────────────────────────────
             elapsed = time.monotonic() - self._gate_start_t
+
+            # FIX 1+4: check close trigger while gate is open, reset everything
+            if gate_close_trigger:
+                self.get_logger().info(
+                    f"[Gate] Closed via z-score — "
+                    f"z_roll={z_roll:.2f}  z_pitch={z_pitch:.2f}  "
+                    f"elapsed={elapsed:.1f}s"
+                )
+                _reset_gate(self)
+                self._write_log()
+                self._corrective_action(d)
+                return
 
             if elapsed >= max(ROLL_MIN_GATE_DURATION, PITCH_MIN_GATE_DURATION):
                 llr_roll  = _axis_llr(mean_roll_deg,
@@ -357,13 +398,13 @@ class RollRTA(PX4Vehicle):
                 settled = (abs(mean_roll_deg)  < ROLL_SETTLED_THRESHOLD_DEG and
                            abs(mean_pitch_deg) < PITCH_SETTLED_THRESHOLD_DEG)
 
+                # FIX 5: settled check active and consistent with baseline loop
                 if settled:
                     self.get_logger().info(
                         f"[Gate] Closed — settled in {elapsed:.1f}s  "
                         f"LLR={self._llr_val:.2f}"
                     )
-                    self._gate_open = False
-                    self._llr_val   = None
+                    _reset_gate(self)  # FIX 2: reset all conditions on settle
                 elif self._cond_a and self._cond_b and not self._is_fault:
                     self.get_logger().warn(
                         f"[Gate+LLR] Sudden fault detected — "
@@ -373,14 +414,13 @@ class RollRTA(PX4Vehicle):
                     self._is_fault = True
 
         self._corrective_action(d)
-        self._write_log()  # always log at the end of every valid tick
+        self._write_log()
 
     # =========================================================================
-    # Baseline loop — FIXED: _write_log() now called on every valid tick
+    # Baseline loop
     # =========================================================================
 
     def _rta_loop_baseline(self):
-        # Guard: need valid sensor data
         if (self._desired_roll  is None or self.current_roll  is None or
                 self._desired_pitch is None or self.current_pitch is None):
             return
@@ -390,22 +430,18 @@ class RollRTA(PX4Vehicle):
 
         self._error_window.append([error_roll, error_pitch])
 
-        # Guard: need a full window before doing anything
         if len(self._error_window) < WINDOW_SIZE:
             return
 
-        n          = len(self._error_window)
-        mean_roll  = sum(s[0] for s in self._error_window) / n
-        mean_pitch = sum(s[1] for s in self._error_window) / n
-        mean_roll_deg  = math.degrees(mean_roll)
-        mean_pitch_deg = math.degrees(mean_pitch)
+        n = len(self._error_window)
+        mean_roll_deg  = math.degrees(sum(s[0] for s in self._error_window) / n)
+        mean_pitch_deg = math.degrees(sum(s[1] for s in self._error_window) / n)
 
-        # calculate the z scores for roll and pitch errors
         z_roll  = abs(mean_roll_deg  - ROLL_NOMINAL_MEAN_DEG)  / ROLL_NOMINAL_STD_DEG
         z_pitch = abs(mean_pitch_deg - PITCH_NOMINAL_MEAN_DEG) / PITCH_NOMINAL_STD_DEG
 
-        gate_open_trigger  = (z_roll > ROLL_GATE_Z_THRESHOLD) or  (z_pitch > PITCH_GATE_Z_THRESHOLD) # -> This opens the gate
-        gate_close_trigger = (z_roll <= ROLL_GATE_CLOSE_Z_THRESHOLD) and (z_pitch <= PITCH_GATE_CLOSE_Z_THRESHOLD) # -> This closes the gate
+        gate_open_trigger  = (z_roll > ROLL_GATE_Z_THRESHOLD) or (z_pitch > PITCH_GATE_Z_THRESHOLD)
+        gate_close_trigger = (z_roll <= ROLL_GATE_CLOSE_Z_THRESHOLD) and (z_pitch <= PITCH_GATE_CLOSE_Z_THRESHOLD)
 
         if not self._gate_open:
             if gate_open_trigger:
@@ -413,28 +449,29 @@ class RollRTA(PX4Vehicle):
                 self._gate_start_t = time.monotonic()
                 self._cond_a = self._cond_b = self._is_fault = False
                 self.get_logger().warn(
-                    f"Multivariate gate opened — "
+                    f"[Gate] Opened — "
                     f"z_roll={z_roll:.2f} z_pitch={z_pitch:.2f} "
                     f"roll_err={mean_roll_deg:.2f}° pitch_err={mean_pitch_deg:.2f}°"
                 )
-            elif gate_close_trigger:
-                self.get_logger().info(
-                    f"Multivariate gate closed — "
-                    f"z_roll={z_roll:.2f} z_pitch={z_pitch:.2f} "
-                    f"roll_err={mean_roll_deg:.2f}° pitch_err={mean_pitch_deg:.2f}°"
-                )
-                self._gate_open    = False
-                self._llr_val  = None
-                self._is_fault = False
-            # FIX: log every tick regardless of gate state
             self._write_log()
             return
 
-        # Gate is open — check elapsed time
-        elapsed = time.monotonic() - self._gate_start_t # --> Checks how long the gate has been open for
-        # checks to see if zscore is higher than threshold for long enough to be a valid fault, if not just log and wait
-        if elapsed < max(ROLL_MIN_GATE_DURATION, PITCH_MIN_GATE_DURATION): 
-            # Gate open but waiting for min duration — still log
+        # ── Gate is open ──────────────────────────────────────────────────────
+        elapsed = time.monotonic() - self._gate_start_t
+
+        # FIX 1: gate close trigger now checked while gate is open
+        if gate_close_trigger:
+            # FIX 6: log only fires here, when gate was actually open
+            self.get_logger().info(
+                f"[Gate] Closed via z-score — "
+                f"z_roll={z_roll:.2f} z_pitch={z_pitch:.2f} "
+                f"elapsed={elapsed:.1f}s"
+            )
+            _reset_gate(self)  # FIX 2: resets _gate_open, _is_fault, _cond_a, _cond_b, _llr_val
+            self._write_log()
+            return
+
+        if elapsed < max(ROLL_MIN_GATE_DURATION, PITCH_MIN_GATE_DURATION):
             self._write_log()
             return
 
@@ -447,29 +484,28 @@ class RollRTA(PX4Vehicle):
                                PITCH_FAULTY_MEAN_DEG,  PITCH_FAULTY_STD_DEG)
         self._llr_val = llr_roll + llr_pitch
         self._cond_a  = self._llr_val > 0
-        self._cond_b  = elapsed >= max(ROLL_SETTLING_TIME_S, PITCH_SETTLING_TIME_S) # --> Give time for controller to come to steady state. if not something is wrong
+        self._cond_b  = elapsed >= max(ROLL_SETTLING_TIME_S, PITCH_SETTLING_TIME_S)
 
         settled = (abs(mean_roll_deg) < ROLL_SETTLED_THRESHOLD_DEG and
                    abs(mean_pitch_deg) < PITCH_SETTLED_THRESHOLD_DEG)
 
-        #if settled:
-        #    self.get_logger().info(
-        #        f"Multivariate gate closed — settled in {elapsed:.1f}s "
-        #        f"(LLR={self._llr_val:.2f})"
-        #    )
-        #    self._gate_open = False
-        #    self._llr_val   = None
-        #    self._write_log()
-        #    return
+        # FIX 5: settled check re-enabled and consistent with _rta_loop
+        if settled:
+            self.get_logger().info(
+                f"[Gate] Closed — settled in {elapsed:.1f}s "
+                f"LLR={self._llr_val:.2f}"
+            )
+            _reset_gate(self)  # FIX 2
+            self._write_log()
+            return
 
-        if self._cond_a and self._cond_b and not settled and not self._is_fault:
+        if self._cond_a and self._cond_b and not self._is_fault:
             self.get_logger().warn(
-                f"MULTIVARIATE FAULT DETECTED — LLR={self._llr_val:.2f} "
+                f"[Gate+LLR] Fault detected — LLR={self._llr_val:.2f} "
                 f"roll_err={mean_roll_deg:.2f}° pitch_err={mean_pitch_deg:.2f}°"
             )
             self._is_fault = True
 
-        # FIX: always log at the end of every valid tick
         self._write_log()
 
     # =========================================================================
@@ -502,6 +538,7 @@ class RollRTA(PX4Vehicle):
             self._fault_logged = True
 
         self._vtol_transition_to_mc()
+        self._transition_mc_t = time.time()   # FIX 7: record transition start
         self.state = "VTOL_TRANSITION_MC"
 
     def _action_cusum_warning(self, mahal_dist: float):
@@ -521,7 +558,7 @@ class RollRTA(PX4Vehicle):
         """Background thread: drains the queue and writes rows to CSV."""
         while True:
             row = self._log_queue.get()
-            if row is None:  # shutdown sentinel
+            if row is None:
                 break
             self._csv_logger.write(row)
 
@@ -559,8 +596,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        node._log_queue.put(None)   # signal writer thread to stop
-        node._log_thread.join()     # wait for any queued rows to flush
+        node._log_queue.put(None)
+        node._log_thread.join()
         node._csv_logger.close()
         node.destroy_node()
         rclpy.shutdown()
